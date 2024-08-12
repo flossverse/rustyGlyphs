@@ -1,4 +1,4 @@
-# PythonGlyphs
+# Rusty Glyphs
 based on Melvin Carvalho glyphs and Runes protocols
 
 ```mermaid
@@ -10,18 +10,15 @@ sequenceDiagram
     participant BN as Bitcoin Network
 
     Note over User,BN: Etch Glyph Operation
-    User->>CLI: Issue etch command with parameters
-    CLI->>GP: Call etch_glyph method
+    User->>CLI: Execute 'issue' command with parameters
+    CLI->>GP: Call etch_glyph()
     GP->>GP: Validate glyph name and parameters
-    GP->>GP: Add optional mint parameters
     GP->>GP: Construct glyphstone data
-    GP->>BC: Request UTXO for funding
+    GP->>BC: Select UTXO for funding
     BC-->>GP: Return suitable UTXO
     GP->>GP: Create glyphstone output
-    alt Premine exists
-        GP->>GP: Create premine output
-    end
-    GP->>GP: Construct full transaction
+    GP->>GP: Create premine output (if applicable)
+    GP->>GP: Construct transaction
     alt Live mode
         GP->>BC: Sign transaction
         BC-->>GP: Return signed transaction
@@ -34,63 +31,65 @@ sequenceDiagram
     end
     CLI-->>User: Display result
 
-    Note over User,BN: Mint Glyph Operation
-    User->>CLI: Issue mint command with parameters
-    CLI->>GP: Call mint_glyph method
-    GP->>BC: Get current block height
-    BC-->>GP: Return block height
-    GP->>GP: Get glyph info and check if mint is open
-    GP->>GP: Add optional mint parameters
-    GP->>GP: Construct mint glyphstone data
-    GP->>BC: Request UTXO for funding
+    Note over User,BN: Initiate Swap Operation
+    User->>CLI: Execute 'initiate_swap' command
+    CLI->>GP: Call initiate_swap()
+    GP->>GP: Generate secret hash
+    GP->>GP: Create HTLC script
+    GP->>BC: Select UTXO for funding
     BC-->>GP: Return suitable UTXO
-    GP->>GP: Create glyphstone output
-    GP->>GP: Create mint destination output
-    GP->>GP: Construct full transaction
-    alt Live mode
-        GP->>BC: Sign transaction
-        BC-->>GP: Return signed transaction
-        GP->>BN: Broadcast transaction
-        BN-->>GP: Return transaction ID
-        GP-->>CLI: Return transaction ID
-    else Dry run
-        GP->>GP: Print transaction details
-        GP-->>CLI: Return None
-    end
-    CLI-->>User: Display result
+    GP->>GP: Construct HTLC output
+    GP->>GP: Construct transaction
+    GP->>BC: Sign transaction
+    BC-->>GP: Return signed transaction
+    GP->>BN: Broadcast transaction
+    BN-->>GP: Return transaction ID
+    GP-->>CLI: Return transaction ID and details for counterparty
+    CLI-->>User: Display swap details and transaction ID
 
-    Note over User,BN: Transfer Glyph Operation
-    User->>CLI: Issue transfer command with parameters
-    CLI->>GP: Call transfer_glyph method
-    GP->>BC: Get glyph balance for input UTXO
-    BC-->>GP: Return glyph balance
-    GP->>GP: Verify sufficient balance
-    GP->>GP: Construct transfer glyphstone data
-    GP->>GP: Create glyphstone output
-    GP->>GP: Create transfer destination output
-    GP->>GP: Construct full transaction
-    alt Live mode
-        GP->>BC: Sign transaction
-        BC-->>GP: Return signed transaction
-        GP->>BN: Broadcast transaction
-        BN-->>GP: Return transaction ID
-        GP-->>CLI: Return transaction ID
-    else Dry run
-        GP->>GP: Print transaction details
-        GP-->>CLI: Return None
-    end
-    CLI-->>User: Display result
+    Note over User,BN: Participate in Swap Operation
+    User->>CLI: Execute 'participate_swap' command with received details
+    CLI->>GP: Call participate_in_swap()
+    GP->>GP: Validate received HTLC details
+    GP->>GP: Create HTLC script based on received details
+    GP->>BC: Select UTXO for funding
+    BC-->>GP: Return suitable UTXO
+    GP->>GP: Construct HTLC output
+    GP->>GP: Construct transaction
+    GP->>BC: Sign transaction
+    BC-->>GP: Return signed transaction
+    GP->>BN: Broadcast transaction
+    BN-->>GP: Return transaction ID
+    GP-->>CLI: Return transaction ID
+    CLI-->>User: Display transaction ID
 
-    Note over User,BN: Nostr Integration (applicable to all operations)
-    alt Nostr public key provided
-        GP->>GP: Create Taproot address with Nostr integration
-    end
+    Note over User,BN: Claim Glyph Operation
+    User->>CLI: Execute 'claim_glyph' command
+    CLI->>GP: Call claim_glyph()
+    GP->>BC: Retrieve HTLC transaction
+    BC-->>GP: Return HTLC transaction details
+    GP->>GP: Construct claim script using secret
+    GP->>GP: Construct claim transaction
+    GP->>BC: Sign transaction
+    BC-->>GP: Return signed transaction
+    GP->>BN: Broadcast transaction
+    BN-->>GP: Return transaction ID
+    GP-->>CLI: Return transaction ID
+    CLI-->>User: Display transaction ID
 
-    Note over User,BN: Cenotaph Handling (applicable to all operations)
-    GP->>GP: Check if glyphstone is malformed (cenotaph)
-    alt Is cenotaph
-        GP->>GP: Replace outputs with burn output
-    end
+    Note over User,BN: Refund Glyph Operation
+    User->>CLI: Execute 'refund_glyph' command
+    CLI->>GP: Call refund_glyph()
+    GP->>BC: Retrieve HTLC transaction
+    BC-->>GP: Return HTLC transaction details
+    GP->>GP: Construct refund script
+    GP->>GP: Construct refund transaction
+    GP->>BC: Sign transaction
+    BC-->>GP: Return signed transaction
+    GP->>BN: Broadcast transaction
+    BN-->>GP: Return transaction ID
+    GP-->>CLI: Return transaction ID
+    CLI-->>User: Display transaction ID
 
 ```
 
