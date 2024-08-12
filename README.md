@@ -13,11 +13,14 @@ sequenceDiagram
     User->>CLI: Issue etch command with parameters
     CLI->>GP: Call etch_glyph method
     GP->>GP: Validate glyph name and parameters
+    GP->>GP: Add optional mint parameters
     GP->>GP: Construct glyphstone data
     GP->>BC: Request UTXO for funding
     BC-->>GP: Return suitable UTXO
     GP->>GP: Create glyphstone output
-    GP->>GP: Create premine output (if applicable)
+    alt Premine exists
+        GP->>GP: Create premine output
+    end
     GP->>GP: Construct full transaction
     alt Live mode
         GP->>BC: Sign transaction
@@ -37,6 +40,7 @@ sequenceDiagram
     GP->>BC: Get current block height
     BC-->>GP: Return block height
     GP->>GP: Get glyph info and check if mint is open
+    GP->>GP: Add optional mint parameters
     GP->>GP: Construct mint glyphstone data
     GP->>BC: Request UTXO for funding
     BC-->>GP: Return suitable UTXO
@@ -87,5 +91,6 @@ sequenceDiagram
     alt Is cenotaph
         GP->>GP: Replace outputs with burn output
     end
+
 ```
 
