@@ -1,4 +1,4 @@
-# PythonGlyphs
+# Rusty Glyphs
 based on Melvin Carvalho glyphs and Runes protocols
 
 ```mermaid
