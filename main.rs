@@ -3,10 +3,11 @@ use std::str::FromStr;
 use bitcoin::{Address, Network, Script, Transaction, TxIn, TxOut, OutPoint, Txid};
 use bitcoin::blockdata::opcodes::all::{OP_RETURN, OP_13, OP_DUP, OP_HASH160, OP_EQUALVERIFY, OP_CHECKSIG, OP_IF, OP_ELSE, OP_CHECKLOCKTIMEVERIFY, OP_DROP, OP_ENDIF};
 use bitcoin::util::psbt::Input as PsbtInput;
-use bitcoin::util::key::PublicKey;
+use bitcoin::util::key::{PublicKey, XOnlyPublicKey};
 use bitcoin::hashes::{Hash, sha256};
 use secp256k1::Secp256k1;
 use bitcoincore_rpc::{Auth, Client, RpcApi};
+use bech32::{ToBase32, Variant};
 use clap::{App, Arg, SubCommand};
 use thiserror::Error;
 use unicode_categories::UnicodeCategories;
@@ -16,6 +17,7 @@ const DEFAULT_SYMBOL_DIVISIBILITY: u8 = 8;
 const DEFAULT_CURRENCY_SYMBOL: char = '¤';
 const MAX_GLYPH_NAME_LENGTH: usize = 26;
 
+/// Custom error enum to handle different error types in GlyphProtocol.
 #[derive(Error, Debug)]
 enum GlyphError {
     #[error("Invalid symbol: {0}")]
@@ -30,8 +32,11 @@ enum GlyphError {
     RpcError(#[from] bitcoincore_rpc::Error),
     #[error("Bitcoin error: {0}")]
     BitcoinError(#[from] bitcoin::util::Error),
+    #[error("Bech32 error: {0}")]
+    Bech32Error(#[from] bech32::Error),
 }
 
+/// Struct representing the GlyphProtocol, containing necessary fields for network and RPC client.
 struct GlyphProtocol {
     network: Network,
     rpc_client: Client,
@@ -39,6 +44,7 @@ struct GlyphProtocol {
 }
 
 impl GlyphProtocol {
+    /// Create a new GlyphProtocol instance.
     fn new(network: Network, rpc_url: &str, rpc_user: &str, rpc_pass: &str) -> Result<Self, GlyphError> {
         let rpc_client = Client::new(rpc_url, Auth::UserPass(rpc_user.to_string(), rpc_pass.to_string()))
             .map_err(GlyphError::RpcError)?;
@@ -49,6 +55,7 @@ impl GlyphProtocol {
         })
     }
 
+    /// Convert a symbol to its integer representation.
     fn symbol_to_int(&self, symbol: &str) -> Result<u64, GlyphError> {
         if !self.is_valid_glyph_name(symbol) {
             return Err(GlyphError::InvalidSymbol(format!("Invalid Glyph name: {}", symbol)));
@@ -62,6 +69,7 @@ impl GlyphProtocol {
         Ok(value)
     }
 
+    /// Convert an integer to its symbol representation.
     fn int_to_symbol(&self, num: u64) -> Result<String, GlyphError> {
         if self.base_offset == 1 && num == 0 {
             return Err(GlyphError::InvalidSymbol("Input must be a positive integer when using 1-26 numbering".to_string()));
@@ -84,6 +92,7 @@ impl GlyphProtocol {
         Ok(symbol.chars().rev().collect())
     }
 
+    /// Encode an integer as a varint.
     fn encode_varint(&self, i: u64) -> Vec<u8> {
         let mut encoded = Vec::new();
         let mut n = i;
@@ -95,6 +104,7 @@ impl GlyphProtocol {
         encoded
     }
 
+    /// Decode a varint to an integer.
     fn decode_varint(&self, encoded: &[u8]) -> Result<(u64, usize), GlyphError> {
         let mut result = 0u64;
         let mut shift = 0;
@@ -111,6 +121,7 @@ impl GlyphProtocol {
         Err(GlyphError::InvalidTransaction("Incomplete varint".to_string()))
     }
 
+    /// Select an unspent transaction output (UTXO) for use in a transaction.
     fn select_utxo(&self, amount_needed_btc: f64) -> Result<PsbtInput, GlyphError> {
         let unspent = self.rpc_client.list_unspent(None, None, None, None, None)?;
         for utxo in unspent {
@@ -121,6 +132,7 @@ impl GlyphProtocol {
         Err(GlyphError::InsufficientFunds(format!("No UTXO found with sufficient funds (needed: {} BTC)", amount_needed_btc)))
     }
 
+    /// Create a Glyphstone output (OP_RETURN output containing Glyph data).
     fn create_glyphstone_output(&self, glyphstone_data: &[u8]) -> TxOut {
         TxOut {
             value: 0,
@@ -128,25 +140,98 @@ impl GlyphProtocol {
         }
     }
 
-    fn create_htlc_script(&self, receiver_pubkey: &PublicKey, sender_pubkey: &PublicKey, 
-                          secret_hash: &[u8], timelock: u32) -> Script {
-        Script::new()
-            .push_opcode(OP_DUP)
-            .push_opcode(OP_HASH160)
-            .push_slice(secret_hash)
-            .push_opcode(OP_EQUALVERIFY)
-            .push_opcode(OP_CHECKSIG)
-            .push_opcode(OP_IF)
-            .push_key(receiver_pubkey)
-            .push_opcode(OP_ELSE)
-            .push_int(timelock as i64)
-            .push_opcode(OP_CHECKLOCKTIMEVERIFY)
-            .push_opcode(OP_DROP)
-            .push_key(sender_pubkey)
-            .push_opcode(OP_ENDIF)
-            .push_opcode(OP_CHECKSIG)
+    /// Create a Taproot address from a Bitcoin address.
+    fn create_taproot_address(&self, bitcoin_address: &str) -> Result<Address, GlyphError> {
+        let addr = Address::from_str(bitcoin_address)?;
+        let pubkey = PublicKey::from_slice(&addr.script_pubkey()[1..])?;
+        
+        let taproot_pubkey = self.get_taproot_pubkey(&pubkey);
+        Ok(Address::p2tr(&Secp256k1::new(), taproot_pubkey, None, self.network))
     }
 
+    /// Get the Taproot public key from a regular public key.
+    fn get_taproot_pubkey(&self, pubkey: &PublicKey) -> XOnlyPublicKey {
+        XOnlyPublicKey::from_slice(&pubkey.serialize()[1..]).expect("Valid public key")
+    }
+
+    /// Create a Glyph output (Taproot output containing Glyph amount).
+    fn create_glyph_output(&self, amount: u64, divisibility: u8,
+                           destination_address: &str) -> Result<TxOut, GlyphError> {
+        if amount > 0 {
+            if destination_address.is_empty() {
+                return Err(GlyphError::InvalidTransaction("Destination address is required for a non-zero amount of Glyphs".to_string()));
+            }
+            let taproot_address = self.create_taproot_address(destination_address)?;
+            
+            let output_value = amount * 10u64.pow(divisibility as u32);
+            Ok(TxOut {
+                value: output_value,
+                script_pubkey: taproot_address.script_pubkey(),
+            })
+        } else {
+            Ok(TxOut {
+                value: 0,
+                script_pubkey: Script::new(),
+            })
+        }
+    }
+
+    /// Generate Nostr-related keys (npub and nrepo).
+    fn generate_nostr_keys(&self, pubkey: &str) -> Result<(String, String), GlyphError> {
+        let npub = self.nip19(pubkey, "npub")?;
+        let nrepo = self.nip19(pubkey, "nrepo")?;
+        Ok((npub, nrepo))
+    }
+
+    /// Encode data with a given prefix using NIP-19 format.
+    fn nip19(&self, data: &str, prefix: &str) -> Result<String, GlyphError> {
+        let data = hex::decode(data)?;
+        let encoded = bech32::encode(prefix, data.to_base32(), Variant::Bech32)?;
+        Ok(encoded)
+    }
+
+    /// Encode Glyphstone data from structured data.
+    fn encode_glyphstone(&self, glyph_info: &HashMap<String, u64>) -> Vec<u8> {
+        let mut glyphstone_data = vec![b'E'];
+
+        if let Some(&name) = glyph_info.get("name") {
+            glyphstone_data.extend_from_slice(&self.encode_varint(name));
+        }
+        if let Some(&divisibility) = glyph_info.get("divisibility") {
+            glyphstone_data.extend_from_slice(&self.encode_varint(divisibility));
+        }
+        if let Some(&symbol) = glyph_info.get("symbol") {
+            glyphstone_data.push(symbol as u8);
+        }
+        if let Some(&mint_cap) = glyph_info.get("mint_cap") {
+            glyphstone_data.push(b'C');
+            glyphstone_data.extend_from_slice(&self.encode_varint(mint_cap));
+        }
+        if let Some(&mint_amount) = glyph_info.get("mint_amount") {
+            glyphstone_data.push(b'A');
+            glyphstone_data.extend_from_slice(&self.encode_varint(mint_amount));
+        }
+        if let Some(&start_height) = glyph_info.get("start_height") {
+            glyphstone_data.push(b'S');
+            glyphstone_data.extend_from_slice(&self.encode_varint(start_height));
+        }
+        if let Some(&end_height) = glyph_info.get("end_height") {
+            glyphstone_data.push(b'H');
+            glyphstone_data.extend_from_slice(&self.encode_varint(end_height));
+        }
+        if let Some(&start_offset) = glyph_info.get("start_offset") {
+            glyphstone_data.push(b'O');
+            glyphstone_data.extend_from_slice(&self.encode_varint(start_offset));
+        }
+        if let Some(&end_offset) = glyph_info.get("end_offset") {
+            glyphstone_data.push(b'F');
+            glyphstone_data.extend_from_slice(&self.encode_varint(end_offset));
+        }
+
+        glyphstone_data
+    }
+
+    /// Etch (issue) a new Glyph.
     fn etch_glyph(&self, name: &str, divisibility: u8, symbol: char, premine: u64,
                   mint_cap: Option<u64>, mint_amount: Option<u64>, 
                   start_height: Option<u32>, end_height: Option<u32>,
@@ -164,14 +249,24 @@ impl GlyphProtocol {
         let glyphstone_output = self.create_glyphstone_output(&glyphstone_data);
         
         let destination_output = if premine > 0 {
-            Some(self.create_glyph_output(premine, divisibility, destination_address, nostr_pubkey)?)
+            Some(self.create_glyph_output(premine, divisibility, destination_address)?)
         } else {
             None
         };
 
-        self.construct_and_broadcast_transaction(glyphstone_output, destination_output, change_address, fee_per_byte, live)
+        let txid = self.construct_and_broadcast_transaction(glyphstone_output, destination_output, change_address, fee_per_byte, live)?;
+
+        // Generate Nostr keys if a Nostr public key is provided.
+        if let Some(nostr_pk) = nostr_pubkey {
+            let (npub, nrepo) = self.generate_nostr_keys(nostr_pk)?;
+            println!("Nostr npub: {}", npub);
+            println!("Nostr nrepo: {}", nrepo);
+        }
+
+        Ok(txid)
     }
 
+    /// Mint new units of an existing Glyph.
     fn mint_glyph(&self, glyph_id: &str, amount: u64, destination_address: &str,
                   change_address: Option<&str>, fee_per_byte: u64, live: bool,
                   nostr_pubkey: Option<&str>) -> Result<String, GlyphError> {
@@ -196,11 +291,21 @@ impl GlyphProtocol {
 
         let glyphstone_output = self.create_glyphstone_output(&glyphstone_data);
         
-        let destination_output = self.create_glyph_output(amount, *glyph_info.get("divisibility").unwrap() as u8, destination_address, nostr_pubkey)?;
+        let destination_output = self.create_glyph_output(amount, *glyph_info.get("divisibility").unwrap() as u8, destination_address)?;
 
-        self.construct_and_broadcast_transaction(glyphstone_output, Some(destination_output), change_address, fee_per_byte, live)
+        let txid = self.construct_and_broadcast_transaction(glyphstone_output, Some(destination_output), change_address, fee_per_byte, live)?;
+
+        // Generate Nostr keys if a Nostr public key is provided.
+        if let Some(nostr_pk) = nostr_pubkey {
+            let (npub, nrepo) = self.generate_nostr_keys(nostr_pk)?;
+            println!("Nostr npub: {}", npub);
+            println!("Nostr nrepo: {}", nrepo);
+        }
+
+        Ok(txid)
     }
 
+    /// Transfer Glyphs from one address to another.
     fn transfer_glyph(&self, glyph_id: &str, input_txid: &str, input_vout: u32, amount: u64,
                       destination_address: &str, change_address: Option<&str>,
                       fee_per_byte: u64, live: bool, nostr_pubkey: Option<&str>) -> Result<String, GlyphError> {
@@ -229,12 +334,22 @@ impl GlyphProtocol {
         let destination_output = if destination_address.starts_with("OP_RETURN") {
             TxOut { value: 0, script_pubkey: Script::new_op_return(&[]) }
         } else {
-            self.create_glyph_output(amount, 0, destination_address, nostr_pubkey)?
+            self.create_glyph_output(amount, 0, destination_address)?
         };
 
-        self.construct_and_broadcast_transaction(glyphstone_output, Some(destination_output), change_address, fee_per_byte, live)
+        let txid = self.construct_and_broadcast_transaction(glyphstone_output, Some(destination_output), change_address, fee_per_byte, live)?;
+
+        // Generate Nostr keys if a Nostr public key is provided.
+        if let Some(nostr_pk) = nostr_pubkey {
+            let (npub, nrepo) = self.generate_nostr_keys(nostr_pk)?;
+            println!("Nostr npub: {}", npub);
+            println!("Nostr nrepo: {}", nrepo);
+        }
+
+        Ok(txid)
     }
 
+    /// Check if a Glyph name is valid.
     fn is_valid_glyph_name(&self, name: &str) -> bool {
         if name.is_empty() || name.len() > MAX_GLYPH_NAME_LENGTH {
             return false;
@@ -256,11 +371,13 @@ impl GlyphProtocol {
         letter_count > 0 && letter_count <= MAX_GLYPH_NAME_LENGTH
     }
 
+    /// Check if a currency symbol is valid.
     fn is_valid_currency_symbol(&self, symbol: char) -> bool {
         let category = symbol.general_category();
         !(category.is_letter() || category.is_number())
     }
 
+    /// Check if minting is currently open for a Glyph.
     fn is_mint_open(&self, glyph_info: &HashMap<String, u64>, current_height: u32) -> bool {
         if let (Some(mint_cap), Some(minted_count)) = (glyph_info.get("mint_cap"), glyph_info.get("minted_count")) {
             if minted_count >= mint_cap {
@@ -281,6 +398,7 @@ impl GlyphProtocol {
         (start_height..end_height).contains(&current_height)
     }
 
+    /// Get information about a Glyph.
     fn get_glyph_info(&self, glyph_id: &str) -> Result<HashMap<String, u64>, GlyphError> {
         let (block_height, tx_index) = Self::parse_glyph_id(glyph_id)?;
         let block_hash = self.rpc_client.get_block_hash(block_height as u64)?;
@@ -312,6 +430,7 @@ impl GlyphProtocol {
         self.decode_glyphstone(&glyphstone_data, block_height)
     }
     
+    /// Decode Glyphstone data.
     fn decode_glyphstone(&self, glyphstone_data: &[u8], etch_height: u32) -> Result<HashMap<String, u64>, GlyphError> {
         let mut glyph_info = HashMap::new();
         glyph_info.insert("etch_height".to_string(), etch_height as u64);
@@ -374,6 +493,7 @@ impl GlyphProtocol {
         Ok(glyph_info)
     }
     
+    /// Get the balance of a Glyph for a specific UTXO.
     fn get_glyph_balance(&self, txid: &str, vout: u32, glyph_id: &str) -> Result<u64, GlyphError> {
         let raw_tx = self.rpc_client.get_raw_transaction_verbose(&Txid::from_str(txid).map_err(|_| GlyphError::InvalidTransaction("Invalid txid".to_string()))?)?;
         
@@ -383,7 +503,7 @@ impl GlyphProtocol {
     
         let output = &raw_tx.vout[vout as usize];
     
-        // Check if the output is unspent
+        // Check if the output is unspent.
         if self.rpc_client.get_tx_out(&Txid::from_str(txid).unwrap(), vout, Some(true)).is_none() {
             return Err(GlyphError::InvalidTransaction(format!("UTXO {}:{} has been spent", txid, vout)));
         }
@@ -399,6 +519,7 @@ impl GlyphProtocol {
         self.decode_glyph_balance(&glyphstone_data, glyph_id)
     }
     
+    /// Decode the balance from Glyphstone data.
     fn decode_glyph_balance(&self, glyphstone_data: &[u8], glyph_id: &str) -> Result<u64, GlyphError> {
         if glyphstone_data[0] != b'T' {
             return Err(GlyphError::InvalidTransaction("Invalid Glyphstone data: doesn't start with 'T'".to_string()));
@@ -416,11 +537,12 @@ impl GlyphProtocol {
         Ok(balance)
     }
     
+    /// Construct and broadcast a transaction.
     fn construct_and_broadcast_transaction(&self, glyphstone_output: TxOut,
                                            destination_output: Option<TxOut>,
                                            change_address: Option<&str>,
                                            fee_per_byte: u64, live: bool) -> Result<String, GlyphError> {
-        let amount_needed_btc = 0.0001; // Initial estimate
+        let amount_needed_btc = 0.0001; // Initial estimate.
         let utxo = self.select_utxo(amount_needed_btc)?;
     
         let mut tx = Transaction {
@@ -471,26 +593,13 @@ impl GlyphProtocol {
         }
     }
     
+    /// Check if a Glyphstone output is a cenotaph (malformed).
     fn is_cenotaph(&self, glyphstone_output: &TxOut) -> bool {
         let script = &glyphstone_output.script_pubkey;
         script.len() < 2 || script[0] != OP_RETURN.into_u8() || script[1] != OP_13.into_u8()
     }
     
-    fn create_taproot_address(&self, bitcoin_address: &str, nostr_pubkey: Option<&str>) -> Result<Address, GlyphError> {
-        let addr = Address::from_str(bitcoin_address)?;
-        let script_pubkey = addr.script_pubkey();
-        
-        let nostr_leaf = if let Some(pubkey) = nostr_pubkey {
-            Script::new_v1_p2tr(&Secp256k1::new(), &PublicKey::from_str(pubkey)?, None)
-        } else {
-            Script::new()
-        };
-    
-        let taproot_script = Script::new_v1_p2tr(&Secp256k1::new(), &PublicKey::from_slice(&script_pubkey[1..])?, Some(nostr_leaf));
-        
-        Ok(Address::p2tr(&Secp256k1::new(), taproot_script.to_inner()[1..33].try_into().unwrap(), None, self.network))
-    }
-    
+    /// Add optional mint parameters to Glyphstone data.
     fn add_optional_mint_params(&self, mut glyphstone_data: Vec<u8>, symbol: char, premine: u64,
                                 mint_cap: Option<u64>, mint_amount: Option<u64>, 
                                 start_height: Option<u32>, end_height: Option<u32>,
@@ -526,30 +635,7 @@ impl GlyphProtocol {
         glyphstone_data
     }
     
-    fn create_glyph_output(&self, amount: u64, divisibility: u8,
-                           destination_address: &str, nostr_pubkey: Option<&str>) -> Result<TxOut, GlyphError> {
-        if amount > 0 {
-            if destination_address.is_empty() {
-                return Err(GlyphError::InvalidTransaction("Destination address is required for a non-zero amount of Glyphs".to_string()));
-            }
-            let destination_address_obj = if let Some(pubkey) = nostr_pubkey {
-                self.create_taproot_address(destination_address, Some(pubkey))?
-            } else {
-                Address::from_str(destination_address)?
-            };
-            let output_value = amount * 10u64.pow(divisibility as u32);
-            Ok(TxOut {
-                value: output_value,
-                script_pubkey: destination_address_obj.script_pubkey(),
-            })
-        } else {
-            Ok(TxOut {
-                value: 0,
-                script_pubkey: Script::new(),
-            })
-        }
-    }
-    
+    /// Parse a Glyph ID into block height and transaction index.
     fn parse_glyph_id(glyph_id: &str) -> Result<(u32, u32), GlyphError> {
         let parts: Vec<&str> = glyph_id.split(':').collect();
         if parts.len() != 2 {
@@ -560,462 +646,485 @@ impl GlyphProtocol {
         Ok((block_height, tx_index))
     }
 
+    /// Initiate an atomic swap.
     fn initiate_swap(&self, glyph_id: &str, amount: u64, destination_address: &str,
         counterparty_pubkey: &str, secret: &str, timelock: u32) -> Result<String, GlyphError> {
-let secret_hash = sha256::Hash::hash(secret.as_bytes());
-let receiver_pubkey = PublicKey::from_str(counterparty_pubkey)
-.map_err(|e| GlyphError::InvalidTransaction(format!("Invalid counterparty pubkey: {}", e)))?;
-let sender_pubkey = self.get_pubkey_from_address(destination_address)?;
+        let secret_hash = sha256::Hash::hash(secret.as_bytes());
+        let receiver_pubkey = PublicKey::from_str(counterparty_pubkey)
+            .map_err(|e| GlyphError::InvalidTransaction(format!("Invalid counterparty pubkey: {}", e)))?;
+        let sender_pubkey = self.get_pubkey_from_address(destination_address)?;
 
-let htlc_script = self.create_htlc_script(&receiver_pubkey, &sender_pubkey, secret_hash.as_inner(), timelock);
+        let htlc_script = self.create_htlc_script(&receiver_pubkey, &sender_pubkey, secret_hash.as_inner(), timelock);
 
-let htlc_output = TxOut {
-value: amount,
-script_pubkey: htlc_script,
-};
+        let htlc_output = TxOut {
+            value: amount,
+            script_pubkey: htlc_script,
+        };
 
-self.construct_and_broadcast_transaction(htlc_output, None, Some(self.rpc_client.get_new_address(None, None)?.to_string().as_str()), 1, true)
+        self.construct_and_broadcast_transaction(htlc_output, None, Some(self.rpc_client.get_new_address(None, None)?.to_string().as_str()), 1, true)
+    }
+
+    /// Participate in an atomic swap.
+    fn participate_in_swap(&self, glyph_id: &str, amount: u64, 
+                  counterparty_htlc_details: &HashMap<String, String>,
+                  destination_address: &str) -> Result<String, GlyphError> {
+        let secret_hash = hex::decode(&counterparty_htlc_details["secret_hash"])
+            .map_err(|e| GlyphError::InvalidTransaction(format!("Invalid secret hash: {}", e)))?;
+        let receiver_pubkey = PublicKey::from_str(&counterparty_htlc_details["receiver_pubkey"])
+            .map_err(|e| GlyphError::InvalidTransaction(format!("Invalid receiver pubkey: {}", e)))?;
+        let sender_pubkey = self.get_pubkey_from_address(destination_address)?;
+        let timelock: u32 = counterparty_htlc_details["timelock"].parse()
+            .map_err(|e| GlyphError::InvalidTransaction(format!("Invalid timelock: {}", e)))?;
+
+        let htlc_script = self.create_htlc_script(&receiver_pubkey, &sender_pubkey, &secret_hash, timelock);
+
+        let htlc_output = TxOut {
+            value: amount,
+            script_pubkey: htlc_script,
+        };
+
+        self.construct_and_broadcast_transaction(htlc_output, None, Some(self.rpc_client.get_new_address(None, None)?.to_string().as_str()), 1, true)
+    }
+
+    /// Claim Glyphs from an HTLC.
+    fn claim_glyph(&self, htlc_txid: &str, secret: &str, destination_address: &str) -> Result<String, GlyphError> {
+        let htlc_tx = self.rpc_client.get_transaction(
+            &Txid::from_str(htlc_txid).map_err(|_| GlyphError::InvalidTransaction("Invalid HTLC txid".to_string()))?
+        )?;
+
+        let htlc_output = htlc_tx.vout.iter()
+            .find(|output| output.script_pub_key.asm.contains("OP_HASH160"))
+            .ok_or_else(|| GlyphError::InvalidTransaction("HTLC output not found".to_string()))?;
+
+        let secret_bytes = secret.as_bytes();
+        let claim_script = Script::new()
+            .push_slice(secret_bytes)
+            .push_opcode(OP_TRUE);
+
+        let tx_in = TxIn {
+            previous_output: OutPoint::new(Txid::from_str(htlc_txid)?, htlc_output.n),
+            script_sig: claim_script,
+            sequence: 0xFFFFFFFF,
+            witness: vec![],
+        };
+
+        let destination_address_obj = Address::from_str(destination_address)?;
+        let tx_out = TxOut {
+            value: htlc_output.value.to_sat(),
+            script_pubkey: destination_address_obj.script_pubkey(),
+        };
+
+        let tx = Transaction {
+            version: 2,
+            lock_time: 0,
+            input: vec![tx_in],
+            output: vec![tx_out],
+        };
+
+        let signed_tx = self.rpc_client.sign_raw_transaction_with_wallet(&tx, None, None)?;
+        let txid = self.rpc_client.send_raw_transaction(&signed_tx.hex)?;
+        Ok(txid.to_string())
+    }
+
+    /// Refund Glyphs from an expired HTLC.
+    fn refund_glyph(&self, htlc_txid: &str, destination_address: &str) -> Result<String, GlyphError> {
+        let htlc_tx = self.rpc_client.get_transaction(
+            &Txid::from_str(htlc_txid).map_err(|_| GlyphError::InvalidTransaction("Invalid HTLC txid".to_string()))?
+        )?;
+
+        let htlc_output = htlc_tx.vout.iter()
+            .find(|output| output.script_pub_key.asm.contains("OP_HASH160"))
+            .ok_or_else(|| GlyphError::InvalidTransaction("HTLC output not found".to_string()))?;
+
+        let refund_script = Script::new().push_opcode(OP_FALSE);
+
+        let tx_in = TxIn {
+            previous_output: OutPoint::new(Txid::from_str(htlc_txid)?, htlc_output.n),
+            script_sig: refund_script,
+            sequence: 0xFFFFFFFF,
+            witness: vec![],
+        };
+
+        let destination_address_obj = Address::from_str(destination_address)?;
+        let tx_out = TxOut {
+            value: htlc_output.value.to_sat(),
+            script_pubkey: destination_address_obj.script_pubkey(),
+        };
+
+        let tx = Transaction {
+            version: 2,
+            lock_time: 0,
+            input: vec![tx_in],
+            output: vec![tx_out],
+        };
+
+        let signed_tx = self.rpc_client.sign_raw_transaction_with_wallet(&tx, None, None)?;
+        let txid = self.rpc_client.send_raw_transaction(&signed_tx.hex)?;
+        Ok(txid.to_string())
+    }
+
+    /// Get the public key from a Bitcoin address.
+    fn get_pubkey_from_address(&self, address: &str) -> Result<PublicKey, GlyphError> {
+        let address_info = self.rpc_client.get_address_info(address)?;
+        PublicKey::from_str(&address_info.pubkey.ok_or_else(|| GlyphError::InvalidTransaction("No pubkey found for address".to_string()))?)
+            .map_err(|e| GlyphError::InvalidTransaction(format!("Invalid pubkey for address: {}", e)))
+    }
+
+    /// Create an HTLC (Hash Time Locked Contract) script.
+    fn create_htlc_script(&self, receiver_pubkey: &PublicKey, sender_pubkey: &PublicKey, 
+                          secret_hash: &[u8], timelock: u32) -> Script {
+        Script::new()
+            .push_opcode(OP_IF)
+            .push_slice(secret_hash)
+            .push_opcode(OP_EQUALVERIFY)
+            .push_key(receiver_pubkey)
+            .push_opcode(OP_ELSE)
+            .push_int(timelock as i64)
+            .push_opcode(OP_CHECKLOCKTIMEVERIFY)
+            .push_opcode(OP_DROP)
+            .push_key(sender_pubkey)
+            .push_opcode(OP_ENDIF)
+            .push_opcode(OP_CHECKSIG)
+    }
 }
 
-fn participate_in_swap(&self, glyph_id: &str, amount: u64, 
-              counterparty_htlc_details: &HashMap<String, String>,
-              destination_address: &str) -> Result<String, GlyphError> {
-let secret_hash = hex::decode(&counterparty_htlc_details["secret_hash"])
-.map_err(|e| GlyphError::InvalidTransaction(format!("Invalid secret hash: {}", e)))?;
-let receiver_pubkey = PublicKey::from_str(&counterparty_htlc_details["receiver_pubkey"])
-.map_err(|e| GlyphError::InvalidTransaction(format!("Invalid receiver pubkey: {}", e)))?;
-let sender_pubkey = self.get_pubkey_from_address(destination_address)?;
-let timelock: u32 = counterparty_htlc_details["timelock"].parse()
-.map_err(|e| GlyphError::InvalidTransaction(format!("Invalid timelock: {}", e)))?;
-
-let htlc_script = self.create_htlc_script(&receiver_pubkey, &sender_pubkey, &secret_hash, timelock);
-
-let htlc_output = TxOut {
-value: amount,
-script_pubkey: htlc_script,
-};
-
-self.construct_and_broadcast_transaction(htlc_output, None, Some(self.rpc_client.get_new_address(None, None)?.to_string().as_str()), 1, true)
-}
-
-fn claim_glyph(&self, htlc_txid: &str, secret: &str, destination_address: &str) -> Result<String, GlyphError> {
-let htlc_tx = self.rpc_client.get_transaction(
-&Txid::from_str(htlc_txid).map_err(|_| GlyphError::InvalidTransaction("Invalid HTLC txid".to_string()))?
-)?;
-
-let htlc_output = htlc_tx.vout.iter()
-.find(|output| output.script_pub_key.asm.contains("OP_HASH160"))
-.ok_or_else(|| GlyphError::InvalidTransaction("HTLC output not found".to_string()))?;
-
-let secret_bytes = secret.as_bytes();
-let claim_script = Script::new()
-.push_slice(secret_bytes)
-.push_opcode(OP_TRUE);
-
-let tx_in = TxIn {
-previous_output: OutPoint::new(Txid::from_str(htlc_txid)?, htlc_output.n),
-script_sig: claim_script,
-sequence: 0xFFFFFFFF,
-witness: vec![],
-};
-
-let destination_address_obj = Address::from_str(destination_address)?;
-let tx_out = TxOut {
-value: htlc_output.value.to_sat(),
-script_pubkey: destination_address_obj.script_pubkey(),
-};
-
-let tx = Transaction {
-version: 2,
-lock_time: 0,
-input: vec![tx_in],
-output: vec![tx_out],
-};
-
-let signed_tx = self.rpc_client.sign_raw_transaction_with_wallet(&tx, None, None)?;
-let txid = self.rpc_client.send_raw_transaction(&signed_tx.hex)?;
-Ok(txid.to_string())
-}
-
-fn refund_glyph(&self, htlc_txid: &str, destination_address: &str) -> Result<String, GlyphError> {
-let htlc_tx = self.rpc_client.get_transaction(
-&Txid::from_str(htlc_txid).map_err(|_| GlyphError::InvalidTransaction("Invalid HTLC txid".to_string()))?
-)?;
-
-let htlc_output = htlc_tx.vout.iter()
-.find(|output| output.script_pub_key.asm.contains("OP_HASH160"))
-.ok_or_else(|| GlyphError::InvalidTransaction("HTLC output not found".to_string()))?;
-
-let refund_script = Script::new().push_opcode(OP_FALSE);
-
-let tx_in = TxIn {
-previous_output: OutPoint::new(Txid::from_str(htlc_txid)?, htlc_output.n),
-script_sig: refund_script,
-sequence: 0xFFFFFFFF,
-witness: vec![],
-};
-
-let destination_address_obj = Address::from_str(destination_address)?;
-let tx_out = TxOut {
-value: htlc_output.value.to_sat(),
-script_pubkey: destination_address_obj.script_pubkey(),
-};
-
-let tx = Transaction {
-version: 2,
-lock_time: 0,
-input: vec![tx_in],
-output: vec![tx_out],
-};
-
-let signed_tx = self.rpc_client.sign_raw_transaction_with_wallet(&tx, None, None)?;
-let txid = self.rpc_client.send_raw_transaction(&signed_tx.hex)?;
-Ok(txid.to_string())
-}
-
-fn get_pubkey_from_address(&self, address: &str) -> Result<PublicKey, GlyphError> {
-let address_info = self.rpc_client.get_address_info(address)?;
-PublicKey::from_str(&address_info.pubkey.ok_or_else(|| GlyphError::InvalidTransaction("No pubkey found for address".to_string()))?)
-.map_err(|e| GlyphError::InvalidTransaction(format!("Invalid pubkey for address: {}", e)))
-}
-}
-
+/// Main function to set up CLI and execute commands.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-let matches = App::new("Glyph Protocol CLI")
-.version("1.0")
-.author("Your Name")
-.about("Interacts with the Glyph Protocol on Bitcoin")
-.subcommand(SubCommand::with_name("symbol")
-.about("Encode or decode a Glyph symbol")
-.arg(Arg::with_name("action")
-   .required(true)
-   .possible_values(&["encode", "decode"])
-   .help("Whether to encode or decode the symbol"))
-.arg(Arg::with_name("value")
-   .required(true)
-   .help("The symbol or integer to encode/decode")))
-.subcommand(SubCommand::with_name("issue")
-.about("Issue a new Glyph")
-.arg(Arg::with_name("name")
-   .required(true)
-   .help("Name of the Glyph to be issued"))
-.arg(Arg::with_name("divisibility")
-   .long("divisibility")
-   .takes_value(true)
-   .default_value("8")
-   .help("Number of decimal places for the Glyph"))
-.arg(Arg::with_name("symbol")
-   .long("symbol")
-   .takes_value(true)
-   .default_value("¤")
-   .help("Currency symbol for the Glyph"))
-.arg(Arg::with_name("premine")
-   .long("premine")
-   .takes_value(true)
-   .default_value("0")
-   .help("Amount of Glyphs to premine"))
-.arg(Arg::with_name("mint_cap")
-   .long("mint_cap")
-   .takes_value(true)
-   .help("Optional cap on the number of mints allowed"))
-.arg(Arg::with_name("mint_amount")
-   .long("mint_amount")
-   .takes_value(true)
-   .help("Optional fixed amount of Glyphs to be minted per transaction"))
-.arg(Arg::with_name("start_height")
-   .long("start_height")
-   .takes_value(true)
-   .help("Optional block height to start the open mint"))
-.arg(Arg::with_name("end_height")
-   .long("end_height")
-   .takes_value(true)
-   .help("Optional block height to end the open mint"))
-.arg(Arg::with_name("start_offset")
-   .long("start_offset")
-   .takes_value(true)
-   .help("Optional block offset from the etch block to start the open mint"))
-.arg(Arg::with_name("end_offset")
-   .long("end_offset")
-   .takes_value(true)
-   .help("Optional block offset from the etch block to end the open mint"))
-.arg(Arg::with_name("destination_address")
-   .long("destination_address")
-   .takes_value(true)
-   .help("Destination address for premined Glyphs"))
-.arg(Arg::with_name("change_address")
-   .long("change_address")
-   .takes_value(true)
-   .help("Change address for Bitcoin"))
-.arg(Arg::with_name("fee")
-   .long("fee")
-   .takes_value(true)
-   .default_value("1")
-   .help("Transaction fee in satoshis per byte"))
-.arg(Arg::with_name("live")
-   .long("live")
-   .help("Broadcast the transaction to the network"))
-.arg(Arg::with_name("nostr_pubkey")
-   .long("nostr_pubkey")
-   .takes_value(true)
-   .help("Optional Nostr public key to integrate via Taproot")))
-.subcommand(SubCommand::with_name("mint")
-.about("Mint new units of a Glyph")
-.arg(Arg::with_name("glyph_id")
-   .required(true)
-   .help("Glyph ID to mint in BLOCK:TX format"))
-.arg(Arg::with_name("amount")
-   .required(true)
-   .help("Amount of Glyphs to mint"))
-.arg(Arg::with_name("destination_address")
-   .required(true)
-   .help("Destination address for the minted Glyphs"))
-.arg(Arg::with_name("change_address")
-   .long("change_address")
-   .takes_value(true)
-   .help("Change address for Bitcoin"))
-.arg(Arg::with_name("fee")
-   .long("fee")
-   .takes_value(true)
-   .default_value("1")
-   .help("Transaction fee in satoshis per byte"))
-.arg(Arg::with_name("live")
-   .long("live")
-   .help("Broadcast the transaction to the network"))
-.arg(Arg::with_name("nostr_pubkey")
-   .long("nostr_pubkey")
-   .takes_value(true)
-   .help("Optional Nostr public key to integrate via Taproot")))
-.subcommand(SubCommand::with_name("transfer")
-.about("Transfer Glyphs")
-.arg(Arg::with_name("glyph_id")
-   .required(true)
-   .help("Glyph ID to transfer in BLOCK:TX format"))
-.arg(Arg::with_name("input_txid")
-   .required(true)
-   .help("Transaction ID of the input UTXO"))
-.arg(Arg::with_name("input_vout")
-   .required(true)
-   .help("Output index of the input UTXO"))
-.arg(Arg::with_name("amount")
-   .required(true)
-   .help("Amount of Glyphs to transfer"))
-.arg(Arg::with_name("destination_address")
-   .required(true)
-   .help("Destination address for the Glyphs"))
-.arg(Arg::with_name("change_address")
-   .long("change_address")
-   .takes_value(true)
-   .help("Change address for Bitcoin and remaining Glyphs"))
-.arg(Arg::with_name("fee")
-   .long("fee")
-   .takes_value(true)
-   .default_value("1")
-   .help("Transaction fee in satoshis per byte"))
-.arg(Arg::with_name("live")
-   .long("live")
-   .help("Broadcast the transaction to the network"))
-.arg(Arg::with_name("nostr_pubkey")
-   .long("nostr_pubkey")
-   .takes_value(true)
-   .help("Optional Nostr public key to integrate via Taproot")))
-.subcommand(SubCommand::with_name("initiate_swap")
-.about("Initiate an atomic swap")
-.arg(Arg::with_name("glyph_id")
-   .required(true)
-   .help("Glyph ID to swap in BLOCK:TX format"))
-.arg(Arg::with_name("amount")
-   .required(true)
-   .help("Amount of Glyphs to swap"))
-.arg(Arg::with_name("destination_address")
-   .required(true)
-   .help("Your Bitcoin address"))
-.arg(Arg::with_name("counterparty_pubkey")
-   .required(true)
-   .help("Counterparty's public key"))
-.arg(Arg::with_name("secret")
-   .required(true)
-   .help("Secret for the HTLC"))
-.arg(Arg::with_name("timelock")
-   .required(true)
-   .help("Timelock for the HTLC")))
-.subcommand(SubCommand::with_name("participate_swap")
-.about("Participate in an atomic swap")
-.arg(Arg::with_name("glyph_id")
-   .required(true)
-   .help("Glyph ID to swap in BLOCK:TX format"))
-.arg(Arg::with_name("amount")
-   .required(true)
-   .help("Amount of Glyphs to swap"))
-.arg(Arg::with_name("destination_address")
-   .required(true)
-   .help("Your Bitcoin address"))
-.arg(Arg::with_name("secret_hash")
-   .required(true)
-   .help("Hash of the secret provided by the counterparty"))
-.arg(Arg::with_name("counterparty_pubkey")
-   .required(true)
-   .help("Counterparty's public key"))
-.arg(Arg::with_name("timelock")
-   .required(true)
-   .help("Timelock for the HTLC")))
-   .subcommand(SubCommand::with_name("claim_glyph")
-   .about("Claim Glyphs from an HTLC")
-   .arg(Arg::with_name("htlc_txid")
-       .required(true)
-       .help("Transaction ID of the HTLC"))
-   .arg(Arg::with_name("secret")
-       .required(true)
-       .help("Secret to claim the HTLC"))
-   .arg(Arg::with_name("destination_address")
-       .required(true)
-       .help("Destination address for the claimed Glyphs")))
-.subcommand(SubCommand::with_name("refund_glyph")
-   .about("Refund Glyphs from an expired HTLC")
-   .arg(Arg::with_name("htlc_txid")
-       .required(true)
-       .help("Transaction ID of the HTLC"))
-   .arg(Arg::with_name("destination_address")
-       .required(true)
-       .help("Destination address for the refunded Glyphs")))
-.get_matches();
+    let matches = App::new("Glyph Protocol CLI")
+        .version("1.0")
+        .author("Your Name")
+        .about("Interacts with the Glyph Protocol on Bitcoin")
+        .subcommand(SubCommand::with_name("symbol")
+            .about("Encode or decode a Glyph symbol")
+            .arg(Arg::with_name("action")
+                .required(true)
+                .possible_values(&["encode", "decode"])
+                .help("Whether to encode or decode the symbol"))
+            .arg(Arg::with_name("value")
+                .required(true)
+                .help("The symbol or integer to encode/decode")))
+        .subcommand(SubCommand::with_name("issue")
+            .about("Issue a new Glyph")
+            .arg(Arg::with_name("name")
+                .required(true)
+                .help("Name of the Glyph to be issued"))
+            .arg(Arg::with_name("divisibility")
+                .long("divisibility")
+                .takes_value(true)
+                .default_value("8")
+                .help("Number of decimal places for the Glyph"))
+            .arg(Arg::with_name("symbol")
+                .long("symbol")
+                .takes_value(true)
+                .default_value("¤")
+                .help("Currency symbol for the Glyph"))
+            .arg(Arg::with_name("premine")
+                .long("premine")
+                .takes_value(true)
+                .default_value("0")
+                .help("Amount of Glyphs to premine"))
+            .arg(Arg::with_name("mint_cap")
+                .long("mint_cap")
+                .takes_value(true)
+                .help("Optional cap on the number of mints allowed"))
+            .arg(Arg::with_name("mint_amount")
+                .long("mint_amount")
+                .takes_value(true)
+                .help("Optional fixed amount of Glyphs to be minted per transaction"))
+            .arg(Arg::with_name("start_height")
+                .long("start_height")
+                .takes_value(true)
+                .help("Optional block height to start the open mint"))
+            .arg(Arg::with_name("end_height")
+                .long("end_height")
+                .takes_value(true)
+                .help("Optional block height to end the open mint"))
+            .arg(Arg::with_name("start_offset")
+                .long("start_offset")
+                .takes_value(true)
+                .help("Optional block offset from the etch block to start the open mint"))
+            .arg(Arg::with_name("end_offset")
+                .long("end_offset")
+                .takes_value(true)
+                .help("Optional block offset from the etch block to end the open mint"))
+            .arg(Arg::with_name("destination_address")
+                .long("destination_address")
+                .takes_value(true)
+                .help("Destination address for premined Glyphs"))
+            .arg(Arg::with_name("change_address")
+                .long("change_address")
+                .takes_value(true)
+                .help("Change address for Bitcoin"))
+            .arg(Arg::with_name("fee")
+                .long("fee")
+                .takes_value(true)
+                .default_value("1")
+                .help("Transaction fee in satoshis per byte"))
+            .arg(Arg::with_name("live")
+                .long("live")
+                .help("Broadcast the transaction to the network"))
+            .arg(Arg::with_name("nostr_pubkey")
+                .long("nostr_pubkey")
+                .takes_value(true)
+                .help("Optional Nostr public key to integrate via Taproot")))
+        .subcommand(SubCommand::with_name("mint")
+            .about("Mint new units of a Glyph")
+            .arg(Arg::with_name("glyph_id")
+                .required(true)
+                .help("Glyph ID to mint in BLOCK:TX format"))
+            .arg(Arg::with_name("amount")
+                .required(true)
+                .help("Amount of Glyphs to mint"))
+            .arg(Arg::with_name("destination_address")
+                .required(true)
+                .help("Destination address for the minted Glyphs"))
+            .arg(Arg::with_name("change_address")
+                .long("change_address")
+                .takes_value(true)
+                .help("Change address for Bitcoin"))
+            .arg(Arg::with_name("fee")
+                .long("fee")
+                .takes_value(true)
+                .default_value("1")
+                .help("Transaction fee in satoshis per byte"))
+            .arg(Arg::with_name("live")
+                .long("live")
+                .help("Broadcast the transaction to the network"))
+            .arg(Arg::with_name("nostr_pubkey")
+                .long("nostr_pubkey")
+                .takes_value(true)
+                .help("Optional Nostr public key to integrate via Taproot")))
+        .subcommand(SubCommand::with_name("transfer")
+            .about("Transfer Glyphs")
+            .arg(Arg::with_name("glyph_id")
+                .required(true)
+                .help("Glyph ID to transfer in BLOCK:TX format"))
+            .arg(Arg::with_name("input_txid")
+                .required(true)
+                .help("Transaction ID of the input UTXO"))
+            .arg(Arg::with_name("input_vout")
+                .required(true)
+                .help("Output index of the input UTXO"))
+            .arg(Arg::with_name("amount")
+                .required(true)
+                .help("Amount of Glyphs to transfer"))
+            .arg(Arg::with_name("destination_address")
+                .required(true)
+                .help("Destination address for the Glyphs"))
+            .arg(Arg::with_name("change_address")
+                .long("change_address")
+                .takes_value(true)
+                .help("Change address for Bitcoin and remaining Glyphs"))
+            .arg(Arg::with_name("fee")
+                .long("fee")
+                .takes_value(true)
+                .default_value("1")
+                .help("Transaction fee in satoshis per byte"))
+            .arg(Arg::with_name("live")
+                .long("live")
+                .help("Broadcast the transaction to the network"))
+            .arg(Arg::with_name("nostr_pubkey")
+                .long("nostr_pubkey")
+                .takes_value(true)
+                .help("Optional Nostr public key to integrate via Taproot")))
+        .subcommand(SubCommand::with_name("initiate_swap")
+            .about("Initiate an atomic swap")
+            .arg(Arg::with_name("glyph_id")
+                .required(true)
+                .help("Glyph ID to swap in BLOCK:TX format"))
+            .arg(Arg::with_name("amount")
+                .required(true)
+                .help("Amount of Glyphs to swap"))
+            .arg(Arg::with_name("destination_address")
+                .required(true)
+                .help("Your Bitcoin address"))
+            .arg(Arg::with_name("counterparty_pubkey")
+                .required(true)
+                .help("Counterparty's public key"))
+            .arg(Arg::with_name("secret")
+                .required(true)
+                .help("Secret for the HTLC"))
+            .arg(Arg::with_name("timelock")
+                .required(true)
+                .help("Timelock for the HTLC")))
+        .subcommand(SubCommand::with_name("participate_swap")
+            .about("Participate in an atomic swap")
+            .arg(Arg::with_name("glyph_id")
+                .required(true)
+                .help("Glyph ID to swap in BLOCK:TX format"))
+            .arg(Arg::with_name("amount")
+                .required(true)
+                .help("Amount of Glyphs to swap"))
+            .arg(Arg::with_name("destination_address")
+                .required(true)
+                .help("Your Bitcoin address"))
+            .arg(Arg::with_name("secret_hash")
+                .required(true)
+                .help("Hash of the secret provided by the counterparty"))
+            .arg(Arg::with_name("counterparty_pubkey")
+                .required(true)
+                .help("Counterparty's public key"))
+            .arg(Arg::with_name("timelock")
+                .required(true)
+                .help("Timelock for the HTLC")))
+        .subcommand(SubCommand::with_name("claim_glyph")
+            .about("Claim Glyphs from an HTLC")
+            .arg(Arg::with_name("htlc_txid")
+                .required(true)
+                .help("Transaction ID of the HTLC"))
+            .arg(Arg::with_name("secret")
+                .required(true)
+                .help("Secret to claim the HTLC"))
+            .arg(Arg::with_name("destination_address")
+                .required(true)
+                .help("Destination address for the claimed Glyphs")))
+        .subcommand(SubCommand::with_name("refund_glyph")
+            .about("Refund Glyphs from an expired HTLC")
+            .arg(Arg::with_name("htlc_txid")
+                .required(true)
+                .help("Transaction ID of the HTLC"))
+            .arg(Arg::with_name("destination_address")
+                .required(true)
+                .help("Destination address for the refunded Glyphs")))
+        .get_matches();
 
-let glyph_protocol = GlyphProtocol::new(Network::Testnet, "http://localhost:18332", "rpcuser", "rpcpassword")?;
+    let glyph_protocol = GlyphProtocol::new(Network::Testnet, "http://localhost:18332", "rpcuser", "rpcpassword")?;
 
-match matches.subcommand() {
-("symbol", Some(symbol_matches)) => {
-   let action = symbol_matches.value_of("action").unwrap();
-   let value = symbol_matches.value_of("value").unwrap();
-   match action {
-       "encode" => {
-           match glyph_protocol.symbol_to_int(value) {
-               Ok(encoded) => println!("Encoded value: {}", encoded),
-               Err(e) => eprintln!("Error: {}", e),
-           }
-       },
-       "decode" => {
-           let num: u64 = value.parse().map_err(|_| GlyphError::InvalidSymbol("Invalid integer".to_string()))?;
-           match glyph_protocol.int_to_symbol(num) {
-               Ok(symbol) => println!("Decoded symbol: {}", symbol),
-               Err(e) => eprintln!("Error: {}", e),
-           }
-       },
-       _ => unreachable!(),
-   }
-},
-("issue", Some(issue_matches)) => {
-   let name = issue_matches.value_of("name").unwrap();
-   let divisibility = issue_matches.value_of("divisibility").unwrap().parse()?;
-   let symbol = issue_matches.value_of("symbol").unwrap().chars().next().unwrap();
-   let premine = issue_matches.value_of("premine").unwrap().parse()?;
-   let mint_cap = issue_matches.value_of("mint_cap").map(|s| s.parse().unwrap());
-   let mint_amount = issue_matches.value_of("mint_amount").map(|s| s.parse().unwrap());
-   let start_height = issue_matches.value_of("start_height").map(|s| s.parse().unwrap());
-   let end_height = issue_matches.value_of("end_height").map(|s| s.parse().unwrap());
-   let start_offset = issue_matches.value_of("start_offset").map(|s| s.parse().unwrap());
-   let end_offset = issue_matches.value_of("end_offset").map(|s| s.parse().unwrap());
-   let destination_address = issue_matches.value_of("destination_address").unwrap_or("");
-   let change_address = issue_matches.value_of("change_address");
-   let fee_per_byte = issue_matches.value_of("fee").unwrap().parse()?;
-   let live = issue_matches.is_present("live");
-   let nostr_pubkey = issue_matches.value_of("nostr_pubkey");
+    match matches.subcommand() {
+        ("symbol", Some(symbol_matches)) => {
+            let action = symbol_matches.value_of("action").unwrap();
+            let value = symbol_matches.value_of("value").unwrap();
+            match action {
+                "encode" => {
+                    match glyph_protocol.symbol_to_int(value) {
+                        Ok(encoded) => println!("Encoded value: {}", encoded),
+                        Err(e) => eprintln!("Error: {}", e),
+                    }
+                },
+                "decode" => {
+                    let num: u64 = value.parse().map_err(|_| GlyphError::InvalidSymbol("Invalid integer".to_string()))?;
+                    match glyph_protocol.int_to_symbol(num) {
+                        Ok(symbol) => println!("Decoded symbol: {}", symbol),
+                        Err(e) => eprintln!("Error: {}", e),
+                    }
+                },
+                _ => unreachable!(),
+            }
+        },
+        ("issue", Some(issue_matches)) => {
+            let name = issue_matches.value_of("name").unwrap();
+            let divisibility = issue_matches.value_of("divisibility").unwrap().parse()?;
+            let symbol = issue_matches.value_of("symbol").unwrap().chars().next().unwrap();
+            let premine = issue_matches.value_of("premine").unwrap().parse()?;
+            let mint_cap = issue_matches.value_of("mint_cap").map(|s| s.parse().unwrap());
+            let mint_amount = issue_matches.value_of("mint_amount").map(|s| s.parse().unwrap());
+            let start_height = issue_matches.value_of("start_height").map(|s| s.parse().unwrap());
+            let end_height = issue_matches.value_of("end_height").map(|s| s.parse().unwrap());
+            let start_offset = issue_matches.value_of("start_offset").map(|s| s.parse().unwrap());
+            let end_offset = issue_matches.value_of("end_offset").map(|s| s.parse().unwrap());
+            let destination_address = issue_matches.value_of("destination_address").unwrap_or("");
+            let change_address = issue_matches.value_of("change_address");
+            let fee_per_byte = issue_matches.value_of("fee").unwrap().parse()?;
+            let live = issue_matches.is_present("live");
+            let nostr_pubkey = issue_matches.value_of("nostr_pubkey");
 
-   match glyph_protocol.etch_glyph(name, divisibility, symbol, premine, mint_cap, mint_amount,
-                                   start_height, end_height, start_offset, end_offset,
-                                   destination_address, change_address, fee_per_byte, live, nostr_pubkey) {
-       Ok(txid) => println!("Glyph issued successfully. Transaction ID: {}", txid),
-       Err(e) => eprintln!("Error: {}", e),
-   }
-},
-("mint", Some(mint_matches)) => {
-   let glyph_id = mint_matches.value_of("glyph_id").unwrap();
-   let amount = mint_matches.value_of("amount").unwrap().parse()?;
-   let destination_address = mint_matches.value_of("destination_address").unwrap();
-   let change_address = mint_matches.value_of("change_address");
-   let fee_per_byte = mint_matches.value_of("fee").unwrap().parse()?;
-   let live = mint_matches.is_present("live");
-   let nostr_pubkey = mint_matches.value_of("nostr_pubkey");
+            match glyph_protocol.etch_glyph(name, divisibility, symbol, premine, mint_cap, mint_amount,
+                                            start_height, end_height, start_offset, end_offset,
+                                            destination_address, change_address, fee_per_byte, live, nostr_pubkey) {
+                Ok(txid) => println!("Glyph issued successfully. Transaction ID: {}", txid),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        },
+        ("mint", Some(mint_matches)) => {
+            let glyph_id = mint_matches.value_of("glyph_id").unwrap();
+            let amount = mint_matches.value_of("amount").unwrap().parse()?;
+            let destination_address = mint_matches.value_of("destination_address").unwrap();
+            let change_address = mint_matches.value_of("change_address");
+            let fee_per_byte = mint_matches.value_of("fee").unwrap().parse()?;
+            let live = mint_matches.is_present("live");
+            let nostr_pubkey = mint_matches.value_of("nostr_pubkey");
 
-   match glyph_protocol.mint_glyph(glyph_id, amount, destination_address, change_address, fee_per_byte, live, nostr_pubkey) {
-       Ok(txid) => println!("Glyphs minted successfully. Transaction ID: {}", txid),
-       Err(e) => eprintln!("Error: {}", e),
-   }
-},
-("transfer", Some(transfer_matches)) => {
-   let glyph_id = transfer_matches.value_of("glyph_id").unwrap();
-   let input_txid = transfer_matches.value_of("input_txid").unwrap();
-   let input_vout = transfer_matches.value_of("input_vout").unwrap().parse()?;
-   let amount = transfer_matches.value_of("amount").unwrap().parse()?;
-   let destination_address = transfer_matches.value_of("destination_address").unwrap();
-   let change_address = transfer_matches.value_of("change_address");
-   let fee_per_byte = transfer_matches.value_of("fee").unwrap().parse()?;
-   let live = transfer_matches.is_present("live");
-   let nostr_pubkey = transfer_matches.value_of("nostr_pubkey");
+            match glyph_protocol.mint_glyph(glyph_id, amount, destination_address, change_address, fee_per_byte, live, nostr_pubkey) {
+                Ok(txid) => println!("Glyphs minted successfully. Transaction ID: {}", txid),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        },
+        ("transfer", Some(transfer_matches)) => {
+            let glyph_id = transfer_matches.value_of("glyph_id").unwrap();
+            let input_txid = transfer_matches.value_of("input_txid").unwrap();
+            let input_vout = transfer_matches.value_of("input_vout").unwrap().parse()?;
+            let amount = transfer_matches.value_of("amount").unwrap().parse()?;
+            let destination_address = transfer_matches.value_of("destination_address").unwrap();
+            let change_address = transfer_matches.value_of("change_address");
+            let fee_per_byte = transfer_matches.value_of("fee").unwrap().parse()?;
+            let live = transfer_matches.is_present("live");
+            let nostr_pubkey = transfer_matches.value_of("nostr_pubkey");
 
-   match glyph_protocol.transfer_glyph(glyph_id, input_txid, input_vout, amount, destination_address, change_address, fee_per_byte, live, nostr_pubkey) {
-       Ok(txid) => println!("Glyphs transferred successfully. Transaction ID: {}", txid),
-       Err(e) => eprintln!("Error: {}", e),
-   }
-},
-("initiate_swap", Some(initiate_matches)) => {
-   let glyph_id = initiate_matches.value_of("glyph_id").unwrap();
-   let amount = initiate_matches.value_of("amount").unwrap().parse()?;
-   let destination_address = initiate_matches.value_of("destination_address").unwrap();
-   let counterparty_pubkey = initiate_matches.value_of("counterparty_pubkey").unwrap();
-   let secret = initiate_matches.value_of("secret").unwrap();
-   let timelock = initiate_matches.value_of("timelock").unwrap().parse()?;
+            match glyph_protocol.transfer_glyph(glyph_id, input_txid, input_vout, amount, destination_address, change_address, fee_per_byte, live, nostr_pubkey) {
+                Ok(txid) => println!("Glyphs transferred successfully. Transaction ID: {}", txid),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        },
+        ("initiate_swap", Some(initiate_matches)) => {
+            let glyph_id = initiate_matches.value_of("glyph_id").unwrap();
+            let amount = initiate_matches.value_of("amount").unwrap().parse()?;
+            let destination_address = initiate_matches.value_of("destination_address").unwrap();
+            let counterparty_pubkey = initiate_matches.value_of("counterparty_pubkey").unwrap();
+            let secret = initiate_matches.value_of("secret").unwrap();
+            let timelock = initiate_matches.value_of("timelock").unwrap().parse()?;
 
-   match glyph_protocol.initiate_swap(glyph_id, amount, destination_address, counterparty_pubkey, secret, timelock) {
-       Ok(txid) => {
-           println!("Swap initiated successfully. Transaction ID: {}", txid);
-           println!("Provide the following details to your counterparty:");
-           println!("Glyph ID: {}", glyph_id);
-           println!("Amount: {}", amount);
-           println!("Secret Hash: {}", hex::encode(sha256::Hash::hash(secret.as_bytes())));
-           println!("Timelock: {}", timelock);
-           println!("Your Public Key: {}", glyph_protocol.get_pubkey_from_address(destination_address)?);
-       },
-       Err(e) => eprintln!("Error: {}", e),
-   }
-},
-("participate_swap", Some(participate_matches)) => {
-   let glyph_id = participate_matches.value_of("glyph_id").unwrap();
-   let amount = participate_matches.value_of("amount").unwrap().parse()?;
-   let destination_address = participate_matches.value_of("destination_address").unwrap();
-   let secret_hash = participate_matches.value_of("secret_hash").unwrap();
-   let counterparty_pubkey = participate_matches.value_of("counterparty_pubkey").unwrap();
-   let timelock = participate_matches.value_of("timelock").unwrap().parse()?;
+            match glyph_protocol.initiate_swap(glyph_id, amount, destination_address, counterparty_pubkey, secret, timelock) {
+                Ok(txid) => {
+                    println!("Swap initiated successfully. Transaction ID: {}", txid);
+                    println!("Provide the following details to your counterparty:");
+                    println!("Glyph ID: {}", glyph_id);
+                    println!("Amount: {}", amount);
+                    println!("Secret Hash: {}", hex::encode(sha256::Hash::hash(secret.as_bytes())));
+                    println!("Timelock: {}", timelock);
+                    println!("Your Public Key: {}", glyph_protocol.get_pubkey_from_address(destination_address)?);
+                },
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        },
+        ("participate_swap", Some(participate_matches)) => {
+            let glyph_id = participate_matches.value_of("glyph_id").unwrap();
+            let amount = participate_matches.value_of("amount").unwrap().parse()?;
+            let destination_address = participate_matches.value_of("destination_address").unwrap();
+            let secret_hash = participate_matches.value_of("secret_hash").unwrap();
+            let counterparty_pubkey = participate_matches.value_of("counterparty_pubkey").unwrap();
+            let timelock = participate_matches.value_of("timelock").unwrap().parse()?;
 
-   let mut counterparty_htlc_details = HashMap::new();
-   counterparty_htlc_details.insert("secret_hash".to_string(), secret_hash.to_string());
-   counterparty_htlc_details.insert("receiver_pubkey".to_string(), counterparty_pubkey.to_string());
-   counterparty_htlc_details.insert("timelock".to_string(), timelock.to_string());
+            let mut counterparty_htlc_details = HashMap::new();
+            counterparty_htlc_details.insert("secret_hash".to_string(), secret_hash.to_string());
+            counterparty_htlc_details.insert("receiver_pubkey".to_string(), counterparty_pubkey.to_string());
+            counterparty_htlc_details.insert("timelock".to_string(), timelock.to_string());
 
-   match glyph_protocol.participate_in_swap(glyph_id, amount, &counterparty_htlc_details, destination_address) {
-       Ok(txid) => println!("Successfully participated in swap. Transaction ID: {}", txid),
-       Err(e) => eprintln!("Error: {}", e),
-   }
-},
-("claim_glyph", Some(claim_matches)) => {
-   let htlc_txid = claim_matches.value_of("htlc_txid").unwrap();
-   let secret = claim_matches.value_of("secret").unwrap();
-   let destination_address = claim_matches.value_of("destination_address").unwrap();
+            match glyph_protocol.participate_in_swap(glyph_id, amount, &counterparty_htlc_details, destination_address) {
+                Ok(txid) => println!("Successfully participated in swap. Transaction ID: {}", txid),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        },
+        ("claim_glyph", Some(claim_matches)) => {
+            let htlc_txid = claim_matches.value_of("htlc_txid").unwrap();
+            let secret = claim_matches.value_of("secret").unwrap();
+            let destination_address = claim_matches.value_of("destination_address").unwrap();
 
-   match glyph_protocol.claim_glyph(htlc_txid, secret, destination_address) {
-       Ok(txid) => println!("Glyphs claimed successfully. Transaction ID: {}", txid),
-       Err(e) => eprintln!("Error: {}", e),
-   }
-},
-("refund_glyph", Some(refund_matches)) => {
-   let htlc_txid = refund_matches.value_of("htlc_txid").unwrap();
-   let destination_address = refund_matches.value_of("destination_address").unwrap();
+            match glyph_protocol.claim_glyph(htlc_txid, secret, destination_address) {
+                Ok(txid) => println!("Glyphs claimed successfully. Transaction ID: {}", txid),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        },
+        ("refund_glyph", Some(refund_matches)) => {
+            let htlc_txid = refund_matches.value_of("htlc_txid").unwrap();
+            let destination_address = refund_matches.value_of("destination_address").unwrap();
 
-   match glyph_protocol.refund_glyph(htlc_txid, destination_address) {
-       Ok(txid) => println!("Glyphs refunded successfully. Transaction ID: {}", txid),
-       Err(e) => eprintln!("Error: {}", e),
-   }
-},
-_ => println!("Invalid command. Use --help for usage information."),
-}
+            match glyph_protocol.refund_glyph(htlc_txid, destination_address) {
+                Ok(txid) => println!("Glyphs refunded successfully. Transaction ID: {}", txid),
+                Err(e) => eprintln!("Error: {}", e),
+            }
+        },
+        _ => println!("Invalid command. Use --help for usage information."),
+    }
 
-Ok(())
+    Ok(())
 }
