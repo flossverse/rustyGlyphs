@@ -1,5 +1,10 @@
 # Rusty Glyphs
-based on Melvin Carvalho glyphs and Runes protocols
+
+..based on Melvin Carvalho glyphs and the preceding Runes protocols
+
+https://github.com/glyph-protocol/glyphs
+https://docs.ordinals.com/runes/specification.html
+
 
 Areas for Improvement:
 Blockchain Querying: Implement the get_glyph_info and get_glyph_balance functions with actual blockchain interaction logic using the bitcoincore_rpc client.
