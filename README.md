@@ -1,9 +1,9 @@
 # Rusty Glyphs
 
-..based on Melvin Carvalho glyphs and the preceding Runes protocols
+..based on [Glyphs](https://github.com/glyph-protocol/glyphs
+) and the preceding [Runes](https://docs.ordinals.com/runes/specification.html
+) protocols
 
-https://github.com/glyph-protocol/glyphs
-https://docs.ordinals.com/runes/specification.html
 
 To execute the provided Rust code with a Testnet wallet, you'll need to set up your environment and follow these steps:
 
