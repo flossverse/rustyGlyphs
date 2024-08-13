@@ -212,3 +212,104 @@ sequenceDiagram
     CLI-->>User: Display transaction ID
 ```
 
+# TO DO
+
+### **Architecture Overview**
+
+1. **Frontend (Web Interface)**:
+    - **Technologies**: HTML, CSS, JavaScript (React.js or Vue.js for dynamic components), Nostr Integration via Alby Wallet.
+    - **Functionality**:
+      - User Interface for creating, viewing, and interacting with Glyphs.
+      - Wallet management (view balance, create transactions).
+      - Nostr login and integration using Alby Wallet.
+      - API calls to the backend (Rust server) for blockchain operations.
+
+2. **Backend (Rust-based Glyph Protocol Server)**:
+    - **Technologies**: Rust, Rocket or Actix-web for the HTTP server, bitcoincore_rpc for Bitcoin interaction, secp256k1, and other necessary crates.
+    - **Functionality**:
+      - Serve API endpoints to handle operations like issuing, minting, transferring Glyphs, and managing atomic swaps.
+      - Integration with the Bitcoin Testnet through bitcoincore_rpc.
+      - Handle blockchain interactions (UTXO selection, transaction signing, broadcasting).
+      - Interface with Nostr for key management and encoding/decoding operations.
+
+3. **Bitcoin Testnet Node**:
+    - **Setup**: Bitcoin Core running on Testnet with RPC enabled.
+    - **Functionality**:
+      - Handle actual blockchain operations (UTXO management, transaction broadcasting).
+      - Provide RPC services that the Rust backend interacts with.
+
+### **Detailed Design**
+
+#### **1. Frontend (Web Interface)**
+
+- **Alby Wallet Integration**:
+  - Use Alby Wallet's Nostr login feature to authenticate users and retrieve their Nostr public keys.
+  - Store or pass this Nostr public key to the backend for operations like issuing or transferring Glyphs.
+
+- **Wallet Management**:
+  - Display the Testnet wallet balance and transaction history.
+  - Allow users to initiate Glyph operations (issue, mint, transfer, swap) through UI forms.
+  - Make API requests to the backend when these forms are submitted.
+
+- **User Interface**:
+  - **Balance Display**: Show the user’s Testnet balance and related transaction IDs.
+  - **Glyphs Management**: Interface to issue, mint, and transfer Glyphs.
+  - **Nostr Features**: Display Nostr-related details like npub and nrepo encoded keys.
+
+#### **2. Backend (Rust Server)**
+
+- **API Endpoints**:
+  - **`/issue`**: Handles Glyph issuance. Takes parameters like name, divisibility, premine, destination address, etc., from the frontend and returns the transaction ID.
+  - **`/mint`**: Endpoint to mint new Glyphs. Accepts parameters like glyph ID, amount, destination address, etc.
+  - **`/transfer`**: Endpoint to transfer existing Glyphs.
+  - **`/swap/initiate`**: Endpoint to initiate an atomic swap.
+  - **`/swap/participate`**: Endpoint to participate in a swap.
+  - **`/claim` and `/refund`**: Handle claiming and refunding of HTLCs.
+
+- **Blockchain Interaction**:
+  - Use `bitcoincore_rpc` to interact with the Bitcoin Testnet node.
+  - Perform operations such as UTXO selection, transaction signing, and broadcasting.
+
+- **Nostr Integration**:
+  - Handle encoding/decoding of Nostr keys and potentially manage Nostr-related operations like publishing events (if required).
+
+#### **3. Bitcoin Testnet Node**
+
+- **Testnet Configuration**:
+  - Ensure the node is configured to handle RPC requests from the Rust backend.
+  - The node must have sufficient Testnet coins to handle operations initiated by users.
+  
+### **Flow Example: Issuing a Glyph**
+
+1. **User Interaction**:
+    - The user logs in using the Alby Wallet (Nostr login).
+    - They fill out a form on the web interface to issue a new Glyph.
+
+2. **Frontend to Backend**:
+    - The form submission triggers an API call to the Rust backend (`/issue` endpoint).
+    - The frontend sends parameters like the Glyph name, symbol, premine amount, etc., to the backend.
+
+3. **Backend Processing**:
+    - The Rust backend validates the request, constructs the Glyphstone data, and selects a suitable UTXO using the Testnet node.
+    - It creates and signs the transaction, then broadcasts it to the Testnet.
+    - The backend sends back the transaction ID to the frontend.
+
+4. **Frontend Response**:
+    - The frontend displays the transaction ID to the user, confirming that the Glyph has been issued.
+
+### **Deployment and Testing**
+
+- **Development Environment**:
+  - Set up a local Testnet node and run the Rust backend locally.
+  - Use the web interface connected to this local setup for development and testing.
+
+- **Production Deployment**:
+  - Deploy the Rust backend on a cloud service or dedicated server.
+  - Use a Testnet node that is accessible to the backend, either self-hosted or a managed service.
+  - Serve the frontend via a standard web server (e.g., Nginx or Apache).
+
+- **Testing**:
+  - Conduct end-to-end testing using the Testnet environment to ensure all operations work seamlessly.
+  - Implement unit and integration tests within the Rust backend.
+
+This design allows you to integrate the Rust-based Glyph Protocol into a modern web interface with Nostr and Bitcoin Testnet support, leveraging the power of both frontend and backend technologies.
