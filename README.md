@@ -150,6 +150,7 @@ sequenceDiagram
     CLI->>GP: Call etch_glyph()
     GP->>GP: Validate glyph name and parameters
     GP->>GP: Construct glyphstone data
+    GP->>GP: (Optional) Generate Nostr keys if nostr_pubkey is provided
     GP->>BC: Select UTXO for funding
     BC-->>GP: Return suitable UTXO
     GP->>GP: Create glyphstone output
@@ -226,6 +227,5 @@ sequenceDiagram
     BN-->>GP: Return transaction ID
     GP-->>CLI: Return transaction ID
     CLI-->>User: Display transaction ID
-
 ```
 
