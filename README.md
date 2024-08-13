@@ -11,6 +11,17 @@ Blockchain Querying: Implement the get_glyph_info and get_glyph_balance function
 Data Encoding and Decoding: The decode_glyphstone method is implemented, but a corresponding encode_glyphstone function might be useful for constructing Glyphstone data from structured data.
 Testing: Implement comprehensive unit tests to ensure the correctness of the core Glyphs logic.
 
+
+The create_taproot_address function is still using the leaf node approach for Nostr integration. If you want to switch to the simpler prefix and checksum swapping approach, you'll need to modify this function.
+
+The nip19 function for Nostr key encoding is not explicitly implemented in the GlyphProtocol struct. You might want to add this if you're planning to use Nostr functionality.
+
+There's no explicit function for generating or managing Nostr keys separately from Bitcoin keys. If this is a desired feature, you might want to add it.
+
+The error handling for Bech32 operations is not explicitly included in the GlyphError enum. You might want to add a variant for Bech32 errors if you're planning to use extensive Bech32 operations.
+
+The get_all_keys function that was present in the simpler approach is not included here. If you want to generate multiple key formats at once, you might want to add this function.
+
 ```mermaid
 sequenceDiagram
     participant User
